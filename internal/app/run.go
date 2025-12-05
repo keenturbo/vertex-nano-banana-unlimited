@@ -40,7 +40,7 @@ type ScenarioResult struct {
 }
 
 func DefaultRunOptions() RunOptions {
-	imagePath := "" // 不设置默认图片路径，要求用户上传
+	imagePath := ""
 
 	downloadDir := os.Getenv("DEFAULT_DOWNLOAD_DIR")
 	if downloadDir == "" {
@@ -49,18 +49,16 @@ func DefaultRunOptions() RunOptions {
 
 	scenarioCount := 1
 	outputRes := "4K"
-
 	stepPause := time.Second
-
 	subStepPause := 500 * time.Millisecond
-	temperature := 1.0 // 默认温度值
+	temperature := 1.0
 
 	return RunOptions{
 		TargetURL:     "https://console.cloud.google.com/vertex-ai/studio/multimodal;mode=prompt?model=gemini-3-pro-image-preview",
 		ImagePath:     imagePath,
 		PromptText:    "",
 		DownloadDir:   downloadDir,
-		Headless:      true,
+		Headless:      false, // 配合 xvfb 使用有界面模式
 		ScenarioCount: scenarioCount,
 		StepPause:     stepPause,
 		SubStepPause:  subStepPause,
@@ -81,7 +79,6 @@ func RunWithOptions(ctx context.Context, opts RunOptions) ([]ScenarioResult, err
 	if opts.PromptText == "" {
 		return nil, errors.New("PromptText 不能为空")
 	}
-	// ImagePath现在可以为空，支持纯文本生成
 	if opts.ScenarioCount < 1 {
 		opts.ScenarioCount = 1
 	}
@@ -122,6 +119,8 @@ func RunWithOptions(ctx context.Context, opts RunOptions) ([]ScenarioResult, err
 	launchOpts := playwright.BrowserTypeLaunchOptions{
 		Headless: playwright.Bool(opts.Headless),
 		Args:     chromiumArgs,
+		// 忽略默认参数，完全自定义
+		IgnoreDefaultArgs: []string{"--enable-automation"},
 	}
 	browser, err := browserType.Launch(launchOpts)
 	if err != nil {
@@ -129,6 +128,7 @@ func RunWithOptions(ctx context.Context, opts RunOptions) ([]ScenarioResult, err
 	}
 	defer browser.Close()
 
+	// 伪装成 1920x1080 的桌面浏览器
 	viewport := playwright.Size{Width: 1920, Height: 1080}
 	runCount := opts.ScenarioCount
 
@@ -255,8 +255,20 @@ func runScenario(ctx context.Context, browser playwright.Browser, viewport playw
 		}
 	}
 
+	// 伪装核心配置
 	ctxOpts := playwright.BrowserNewContextOptions{
 		Viewport: &viewport,
+		// 使用最新的桌面 Chrome User-Agent
+		UserAgent: playwright.String("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"),
+		Locale:    playwright.String("zh-CN"),
+		TimezoneId: playwright.String("Asia/Shanghai"),
+		// 修正字段名 ExtraHTTPHeaders -> ExtraHttpHeaders
+		ExtraHttpHeaders: map[string]string{
+			"Accept-Language": "zh-CN,zh-Hans;q=0.9",
+			"Sec-Fetch-Site":  "none",
+			"Sec-Fetch-Mode":  "navigate",
+			"Sec-Fetch-Dest":  "document",
+		},
 	}
 	if proxyURL != "" {
 		ctxOpts.Proxy = proxyOptions(proxyURL)
@@ -266,6 +278,30 @@ func runScenario(ctx context.Context, browser playwright.Browser, viewport playw
 		return fail("new context", fmt.Errorf("new context: %w", err))
 	}
 	defer browserCtx.Close()
+
+	// 注入反检测脚本（Stealth）
+	err = browserCtx.AddInitScript(playwright.Script{
+		Content: playwright.String(`
+			Object.defineProperty(navigator, 'webdriver', {
+				get: () => undefined,
+			});
+			Object.defineProperty(navigator, 'plugins', {
+				get: () => [1, 2, 3],
+			});
+			Object.defineProperty(navigator, 'languages', {
+				get: () => ['zh-CN', 'zh'],
+			});
+			const originalQuery = window.navigator.permissions.query;
+			window.navigator.permissions.query = (parameters) => (
+				parameters.name === 'notifications' ?
+					Promise.resolve({ state: Notification.permission }) :
+					originalQuery(parameters)
+			);
+		`),
+	})
+	if err != nil {
+		return fail("add init script", err)
+	}
 
 	page, err := browserCtx.NewPage()
 	if err != nil {
@@ -279,9 +315,10 @@ func runScenario(ctx context.Context, browser playwright.Browser, viewport playw
 	fmt.Printf("\n🚀 [%d] Starting (engine=%s headless=%v proxy=%s)\n", id, engineName, opts.Headless, proxyInfo)
 	fmt.Printf("🔎 [%d] Navigating to %s\n", id, opts.TargetURL)
 
+	// 增加超时时间到 45 秒
 	_, err = page.Goto(opts.TargetURL, playwright.PageGotoOptions{
 		WaitUntil: playwright.WaitUntilStateDomcontentloaded,
-		Timeout:   playwright.Float(15_000),
+		Timeout:   playwright.Float(45_000),
 	})
 	if err != nil {
 		fmt.Printf("⚠️ [%d] goto error: %v\n", id, err)
@@ -293,8 +330,10 @@ func runScenario(ctx context.Context, browser playwright.Browser, viewport playw
 
 	_ = page.BringToFront()
 	fmt.Printf("ℹ️ [%d] Brought page to front\n", id)
-	_ = page.Mouse().Click(5, 5)
-	_ = page.Keyboard().Press("Escape")
+	
+	// 随机延迟，模拟真人
+	time.Sleep(2 * time.Second)
+	_ = page.Mouse().Click(100, 100)
 	time.Sleep(opts.SubStepPause)
 
 	if err := step("Accept terms dialog", opts.StepPause, func() (bool, error) {
@@ -343,7 +382,6 @@ func runScenario(ctx context.Context, browser playwright.Browser, viewport playw
 		return fail("prompt is empty after entry", fmt.Errorf("prompt is empty after entry"))
 	}
 
-	// 只有当ImagePath不为空时才上传图片
 	if opts.ImagePath != "" {
 		if err := step("Upload local image", opts.StepPause, func() (bool, error) {
 			return steps.UploadLocalFile(page, opts.ImagePath)
@@ -421,6 +459,10 @@ var (
 		"--disable-blink-features=AutomationControlled",
 		"--no-sandbox",
 		"--disable-dev-shm-usage",
-		"--incognito",
+		"--disable-infobars",
+		"--exclude-switches=enable-automation",
+		"--use-fake-ui-for-media-stream",
+		"--use-fake-device-for-media-stream",
+		"--enable-features=NetworkService,NetworkServiceInProcess",
 	}
 )
